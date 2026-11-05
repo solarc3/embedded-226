@@ -43,6 +43,7 @@
 
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
+DMA_HandleTypeDef hdma_adc1;
 
 I2C_HandleTypeDef hi2c1;
 
@@ -56,12 +57,17 @@ const osThreadAttr_t defaultTask_attributes = {
   .priority = (osPriority_t) osPriorityNormal,
 };
 /* USER CODE BEGIN PV */
-
+//pq dentro de PV?
+// global: el DMA escribe aquí continuamente, debe existir siempre (no en el stack)
+// volatile: la modifica el hardware, el compilador no debe asumir que no cambia
+volatile uint16_t pots[4];
+volatile uint32_t n_freq = 0, n_wave = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_SPI2_Init(void);
@@ -74,26 +80,28 @@ void StartDefaultTask(void *argument);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 #define AD9833_MCLK 25000000.0f
-
+//Envía una palabra de 16 bits: baja FSYNC, transmite por SPI2 y sube FSYNC. Las otras dos la usan.
 static void ad9833_write(uint16_t w) {
   HAL_GPIO_WritePin(AD_FSYNC_GPIO_Port, AD_FSYNC_Pin, GPIO_PIN_RESET);
   HAL_SPI_Transmit(&hspi2, (uint8_t *)&w, 1, 10);
   HAL_GPIO_WritePin(AD_FSYNC_GPIO_Port, AD_FSYNC_Pin, GPIO_PIN_SET);
 }
-
+//Calcula el registro de 28 bits (f · 2²⁸ / 25 MHz) y lo envía en dos palabras de 14 bits a FREQ0
 static void ad9833_set_freq(float f) {
   uint32_t reg = (uint32_t)(f * 268435456.0f / AD9833_MCLK);
   ad9833_write(0x4000 | (reg & 0x3FFF));
   ad9833_write(0x4000 | ((reg >> 14) & 0x3FFF));
 }
-
+//La secuencia de arranque del datasheet: reset, frecuencia, fase y salida del reset con sinusoide
 static void ad9833_init(float f) {
   ad9833_write(0x2100);
   ad9833_set_freq(f);
   ad9833_write(0xC000);
   ad9833_write(0x2000);
 }
-
+static void ad9833_set_wave(uint16_t ctrl) {
+  ad9833_write(ctrl);
+}
 /* USER CODE END 0 */
 
 /**
@@ -125,10 +133,15 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_I2C1_Init();
   MX_ADC1_Init();
   MX_SPI2_Init();
   /* USER CODE BEGIN 2 */
+  //se agrega aca el codigo pq se inicializa recien el dma
+  HAL_ADC_Start_DMA(&hadc1, (uint32_t *)pots, 4);
+  //Enables ADC DMA request after last transfer (Single-ADC mode) and enables ADC peripheral
+__HAL_DMA_DISABLE_IT(&hdma_adc1, DMA_IT_TC | DMA_IT_HT);
 
   /* USER CODE END 2 */
 
@@ -247,14 +260,14 @@ static void MX_ADC1_Init(void)
   hadc1.Instance = ADC1;
   hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
   hadc1.Init.Resolution = ADC_RESOLUTION_12B;
-  hadc1.Init.ScanConvMode = DISABLE;
-  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.ScanConvMode = ENABLE;
+  hadc1.Init.ContinuousConvMode = ENABLE;
   hadc1.Init.DiscontinuousConvMode = DISABLE;
   hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
   hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
   hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
-  hadc1.Init.NbrOfConversion = 1;
-  hadc1.Init.DMAContinuousRequests = DISABLE;
+  hadc1.Init.NbrOfConversion = 4;
+  hadc1.Init.DMAContinuousRequests = ENABLE;
   hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
   if (HAL_ADC_Init(&hadc1) != HAL_OK)
   {
@@ -266,6 +279,33 @@ static void MX_ADC1_Init(void)
   sConfig.Channel = ADC_CHANNEL_1;
   sConfig.Rank = 1;
   sConfig.SamplingTime = ADC_SAMPLETIME_144CYCLES;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_2;
+  sConfig.Rank = 2;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_3;
+  sConfig.Rank = 3;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_8;
+  sConfig.Rank = 4;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
     Error_Handler();
@@ -345,6 +385,22 @@ static void MX_SPI2_Init(void)
   /* USER CODE BEGIN SPI2_Init 2 */
 
   /* USER CODE END SPI2_Init 2 */
+
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA2_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA2_Stream0_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
 
 }
 
@@ -515,27 +571,38 @@ void StartDefaultTask(void *argument)
   // ODR_XL2 ODR_XL1 ODR_XL0 FS1_XL FS0_XL BW_SCAL_ODR BW_XL1 BW_XL0
   // 0 1 1 0 0 0 0 0 
   //ahora separar 4 bytes en 2 cadenas xxxx xxxx y convertirlo en hexadecimal para luego usar HAL_I2C_Mem_Writre
-    ad9833_init(440.0f);
+  ad9833_init(440.0f);
   uint32_t last = 0xFFFF;
   volatile uint32_t v = 0;
   volatile float f = 0;
-
+  /*pot 0 es frecuencia exponencial
+    pot 1 es cutoff exponencial (por ahora controla el tipo de onda en base a su lugar, se cambia dps)
+    pot 2 es resonancia lineal
+    pot 3 es mezcla wet/dry lineal
+    encoder menu 
+  */
+  uint8_t wave_last = 0xFF; //contador de wave
+  float filt0 = pots[0];
   for(;;)
-  {
-    HAL_ADC_Start(&hadc1);
-    HAL_ADC_PollForConversion(&hadc1, 10);
-    v = HAL_ADC_GetValue(&hadc1);
 
-    if (v > last + 8 || v + 8 < last) {
+  {
+    filt0 += 0.1f * ((float)pots[0] - filt0);
+    v = (uint32_t)filt0;
+
+    if (v > last + 8 || v + 8 < last) {//ver ultimo valor, cual es el rango de valores?histerisis
       last = v;
-      f = 20.0f * powf(100.0f, v / 4095.0f);
+      f = 20.0f * powf(100.0f, v / 4095.0f);//en caso de cambio, se asigna frecuencia, 20Hz a 2kHz, logaritmica
       ad9833_set_freq(f);
     }
+    //// pots[1]: forma de onda en 3 tramos
+    uint32_t w = pots[1];
+    uint8_t wave = (w < 1365) ? 0 : (w < 2730) ? 1 : 2; //tercios de opciones, 0 seno, 1 triangular, 2 cuadrada
+    if (wave != wave_last) {
+      wave_last = wave;
+      static const uint16_t ctrl[3] = { 0x2000, 0x2002, 0x2028 };  // seno, triangular, cuadrada
+      ad9833_set_wave(ctrl[wave]);
+    }
     osDelay(20);
-  }
-  for(;;)
-  {
-    osDelay(1000);
   }
   /* USER CODE END 5 */
 }
