@@ -38,6 +38,7 @@
 #define AUDIO_AMP    8000.0f     // amplitud (~25% de la escala de int16) para no saturar
 #define TWO_PI       6.28318530718f
 #define CS43L22_ADDR (0x4A << 1)
+#define IN_GAIN      16.0f       // ganancia de la entrada: ~430 cuentas de amplitud → ~7000
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -68,6 +69,8 @@ const osThreadAttr_t defaultTask_attributes = {
   .priority = (osPriority_t) osPriorityNormal,
 };
 /* USER CODE BEGIN PV */
+uint16_t adc_in[AUDIO_BLOCK * 2];   // entrada mono: 2 mitades × 128 muestras
+float in_dc = 500.0f;               // estimación del nivel DC de la entrada (cuentas del ADC)
 //pq dentro de PV?
 // global: el DMA escribe aquí continuamente, debe existir siempre (no en el stack)
 // volatile: la modifica el hardware, el compilador no debe asumir que no cambia
@@ -154,6 +157,28 @@ static void audio_fill(int16_t *dst, uint32_t n) {
     if (audio_phase >= TWO_PI) audio_phase -= TWO_PI;
   }
 }
+// Satura un float al rango de int16 (evita que se "dé vuelta" al pasar de 32767)
+static int16_t sat16(float x) {
+  if (x >  32767.0f) return  32767;
+  if (x < -32768.0f) return -32768;
+  return (int16_t)x;
+}
+
+// Copia un bloque desde la entrada (ADC2) a la salida (I2S), en estéreo
+static void audio_from_adc(int16_t *dst) {
+  // posición donde el DMA del ADC va a escribir la próxima muestra
+  uint32_t wpos = AUDIO_BLOCK * 2 - __HAL_DMA_GET_COUNTER(&hdma_adc2);
+  // leer la mitad que el ADC NO está escribiendo
+  const uint16_t *src = (wpos < AUDIO_BLOCK) ? &adc_in[AUDIO_BLOCK] : &adc_in[0];
+
+  for (uint32_t i = 0; i < AUDIO_BLOCK; i++) {
+    float x = (float)src[i];
+    in_dc += 0.0005f * (x - in_dc);              // promedio lento = nivel DC
+    int16_t s = sat16((x - in_dc) * IN_GAIN);    // quitar DC y amplificar
+    dst[2 * i]     = s;                          // L
+    dst[2 * i + 1] = s;                          // R
+  }
+}
 /* USER CODE END 0 */
 
 /**
@@ -202,10 +227,13 @@ int main(void)
   // CS43L22: sale del reset (PD4 en alto) y espera a que arranque
   HAL_GPIO_WritePin(Audio_RST_GPIO_Port, Audio_RST_Pin, GPIO_PIN_SET);
   HAL_Delay(10);
-    cs43l22_init();                                       // configura el códec (apagado)
-  audio_fill(audio_buf, AUDIO_BLOCK * 2);               // llena el buffer completo antes de arrancar
-  HAL_I2S_Transmit_DMA(&hi2s3, (uint16_t *)audio_buf, AUDIO_BLOCK * 2 * 2);  // arranca relojes + DMA
-  cs43l22_write(0x02, 0x9E);                            // Power Ctl 1: encender, ya con MCLK presente
+  cs43l22_init();                                        // configura el códec (apagado)
+  // ADC2: espera los disparos de WS; el DMA llena adc_in[] en círculo
+  HAL_ADC_Start_DMA(&hadc2, (uint32_t *)adc_in, AUDIO_BLOCK * 2);
+  __HAL_DMA_DISABLE_IT(&hdma_adc2, DMA_IT_TC | DMA_IT_HT);   // la sincronización la hace el I2S
+  // I2S: arranca relojes y DMA (audio_buf parte en ceros = silencio)
+  HAL_I2S_Transmit_DMA(&hi2s3, (uint16_t *)audio_buf, AUDIO_BLOCK * 2 * 2);
+  cs43l22_write(0x02, 0x9E);                             // encender el códec con MCLK presente                           // Power Ctl 1: encender, ya con MCLK presente
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -736,13 +764,13 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-// El DMA terminó de enviar la mitad A: rellenarla mientras envía la B
+// El DMA terminó de enviar la mitad A: llenarla con lo que entró por el ADC
 void HAL_I2S_TxHalfCpltCallback(I2S_HandleTypeDef *hi2s) {
-  audio_fill(&audio_buf[0], AUDIO_BLOCK);
+  audio_from_adc(&audio_buf[0]);
 }
-// El DMA terminó de enviar la mitad B: rellenarla mientras vuelve a enviar la A
+// El DMA terminó de enviar la mitad B: llenarla con lo que entró por el ADC
 void HAL_I2S_TxCpltCallback(I2S_HandleTypeDef *hi2s) {
-  audio_fill(&audio_buf[AUDIO_BLOCK * 2], AUDIO_BLOCK);
+  audio_from_adc(&audio_buf[AUDIO_BLOCK * 2]);
 }
 /* USER CODE END 4 */
 
