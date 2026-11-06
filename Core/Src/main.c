@@ -740,6 +740,7 @@ void StartDefaultTask(void *argument)
       last = v;
       f = 20.0f * powf(100.0f, v / 4095.0f); // 20 Hz a 2 kHz, curva exponencial
       ad9833_set_freq(f);
+      audio_freq = f; 
     }
 
     // encoder: cada clic avanza la forma de onda (seno -> triangular -> cuadrada -> seno...)
