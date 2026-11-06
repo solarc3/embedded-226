@@ -69,7 +69,7 @@ const osThreadAttr_t defaultTask_attributes = {
   .priority = (osPriority_t) osPriorityNormal,
 };
 /* USER CODE BEGIN PV */
-uint16_t adc_in[AUDIO_BLOCK * 2];   // entrada mono: 2 mitades × 128 muestras
+volatile uint16_t adc_in[AUDIO_BLOCK * 2];   // entrada mono: 2 mitades × 128 muestras
 float in_dc = 500.0f;               // estimación del nivel DC de la entrada (cuentas del ADC)
 //pq dentro de PV?
 // global: el DMA escribe aquí continuamente, debe existir siempre (no en el stack)
@@ -146,17 +146,7 @@ static void cs43l22_init(void) {
 }
 
 //generacion audio
-// Llena n frames estéreo con una sinusoide, la misma muestra en L y R
-static void audio_fill(int16_t *dst, uint32_t n) {
-  float inc = TWO_PI * audio_freq / AUDIO_FS;         // avance de fase por muestra
-  for (uint32_t i = 0; i < n; i++) {
-    int16_t s = (int16_t)(AUDIO_AMP * sinf(audio_phase));
-    dst[2 * i]     = s;                               // L
-    dst[2 * i + 1] = s;                               // R
-    audio_phase += inc;
-    if (audio_phase >= TWO_PI) audio_phase -= TWO_PI;
-  }
-}
+
 // Satura un float al rango de int16 (evita que se "dé vuelta" al pasar de 32767)
 static int16_t sat16(float x) {
   if (x >  32767.0f) return  32767;
@@ -169,8 +159,7 @@ static void audio_from_adc(int16_t *dst) {
   // posición donde el DMA del ADC va a escribir la próxima muestra
   uint32_t wpos = AUDIO_BLOCK * 2 - __HAL_DMA_GET_COUNTER(&hdma_adc2);
   // leer la mitad que el ADC NO está escribiendo
-  const uint16_t *src = (wpos < AUDIO_BLOCK) ? &adc_in[AUDIO_BLOCK] : &adc_in[0];
-
+  const volatile uint16_t *src = (wpos < AUDIO_BLOCK) ? &adc_in[AUDIO_BLOCK] : &adc_in[0];
   for (uint32_t i = 0; i < AUDIO_BLOCK; i++) {
     float x = (float)src[i];
     in_dc += 0.0005f * (x - in_dc);              // promedio lento = nivel DC
