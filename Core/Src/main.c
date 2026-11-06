@@ -49,6 +49,8 @@ I2C_HandleTypeDef hi2c1;
 
 SPI_HandleTypeDef hspi2;
 
+TIM_HandleTypeDef htim3;
+
 /* Definitions for defaultTask */
 osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = {
@@ -71,6 +73,7 @@ static void MX_DMA_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_SPI2_Init(void);
+static void MX_TIM3_Init(void);
 void StartDefaultTask(void *argument);
 
 /* USER CODE BEGIN PFP */
@@ -137,12 +140,13 @@ int main(void)
   MX_I2C1_Init();
   MX_ADC1_Init();
   MX_SPI2_Init();
+  MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
   //se agrega aca el codigo pq se inicializa recien el dma
   HAL_ADC_Start_DMA(&hadc1, (uint32_t *)pots, 4);
   //Enables ADC DMA request after last transfer (Single-ADC mode) and enables ADC peripheral
 __HAL_DMA_DISABLE_IT(&hdma_adc1, DMA_IT_TC | DMA_IT_HT);
-
+HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -389,6 +393,55 @@ static void MX_SPI2_Init(void)
 }
 
 /**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void)
+{
+
+  /* USER CODE BEGIN TIM3_Init 0 */
+
+  /* USER CODE END TIM3_Init 0 */
+
+  TIM_Encoder_InitTypeDef sConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM3_Init 1 */
+
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 0;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 65535;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
+  sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC1Filter = 10;
+  sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC2Filter = 10;
+  if (HAL_TIM_Encoder_Init(&htim3, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM3_Init 2 */
+
+  /* USER CODE END TIM3_Init 2 */
+
+}
+
+/**
   * Enable DMA controller clock
   */
 static void MX_DMA_Init(void)
@@ -523,6 +576,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(OTG_FS_OverCurrent_GPIO_Port, &GPIO_InitStruct);
 
+  /*Configure GPIO pin : ENC_SW_Pin */
+  GPIO_InitStruct.Pin = ENC_SW_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(ENC_SW_GPIO_Port, &GPIO_InitStruct);
+
   /*Configure GPIO pin : MEMS_INT2_Pin */
   GPIO_InitStruct.Pin = MEMS_INT2_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_EVT_RISING;
@@ -575,28 +634,30 @@ void StartDefaultTask(void *argument)
   uint32_t last = 0xFFFF;
   volatile uint32_t v = 0;
   volatile float f = 0;
-  /*pot 0 es frecuencia exponencial
-    pot 1 es cutoff exponencial (por ahora controla el tipo de onda en base a su lugar, se cambia dps)
-    pot 2 es resonancia lineal
-    pot 3 es mezcla wet/dry lineal
-    encoder menu 
+  /*pots[0]: frecuencia (curva exponencial)
+    pots[1]: cutoff del filtro (exponencial) - reservado, aun sin uso
+    pots[2]: resonancia (lineal) - reservado
+    pots[3]: mezcla dry/wet del delay (lineal) - reservado
+    encoder: forma de onda (seno / triangular / cuadrada), despues menu
   */
-  uint8_t wave_last = 0xFF; //contador de wave
+  uint8_t wave_last = 0xFF; // ultima forma de onda enviada; 0xFF fuerza el primer envio
   float filt0 = pots[0];
   for(;;)
-
   {
+    // pots[0]: frecuencia, filtrada con EMA + histeresis de 8 cuentas
     filt0 += 0.1f * ((float)pots[0] - filt0);
     v = (uint32_t)filt0;
 
-    if (v > last + 8 || v + 8 < last) {//ver ultimo valor, cual es el rango de valores?histerisis
+    if (v > last + 8 || v + 8 < last) {
       last = v;
-      f = 20.0f * powf(100.0f, v / 4095.0f);//en caso de cambio, se asigna frecuencia, 20Hz a 2kHz, logaritmica
+      f = 20.0f * powf(100.0f, v / 4095.0f); // 20 Hz a 2 kHz, curva exponencial
       ad9833_set_freq(f);
     }
-    //// pots[1]: forma de onda en 3 tramos
-    uint32_t w = pots[1];
-    uint8_t wave = (w < 1365) ? 0 : (w < 2730) ? 1 : 2; //tercios de opciones, 0 seno, 1 triangular, 2 cuadrada
+
+    // encoder: cada clic avanza la forma de onda (seno -> triangular -> cuadrada -> seno...)
+    volatile uint16_t cnt = __HAL_TIM_GET_COUNTER(&htim3);
+    int16_t pos = (int16_t)cnt / 4;        // 4 cuentas por clic (verificar en Live Watch)
+    uint8_t wave = ((pos % 3) + 3) % 3;    // siempre 0..2, tambien con pos negativo
     if (wave != wave_last) {
       wave_last = wave;
       static const uint16_t ctrl[3] = { 0x2000, 0x2002, 0x2028 };  // seno, triangular, cuadrada
