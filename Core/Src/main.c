@@ -78,6 +78,8 @@ volatile uint16_t pots[4];
 int16_t audio_buf[AUDIO_BLOCK * 2 * 2];   // 2 mitades × 128 frames × 2 canales = 512
 volatile float audio_freq = 440.0f;       // frecuencia de la sinusoide generada en el MCU
 float audio_phase = 0.0f;                 // fase acumulada, en radianes
+volatile float flt_g = 1.0f;   // coeficiente de cada etapa (0..1), lo calcula la tarea
+volatile float flt_k = 2.5f;   // resonancia (0..~3.9); fija por ahora (el pot 3 está desconectado)
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -154,18 +156,32 @@ static int16_t sat16(float x) {
   return (int16_t)x;
 }
 
-// Copia un bloque desde la entrada (ADC2) a la salida (I2S), en estéreo
+
+// Copia un bloque desde el ADC2, lo pasa por el filtro ladder y lo envía al I2S
 static void audio_from_adc(int16_t *dst) {
-  // posición donde el DMA del ADC va a escribir la próxima muestra
+  static float y1 = 0, y2 = 0, y3 = 0, y4 = 0;   // estado de las 4 etapas (persiste entre bloques)
+
   uint32_t wpos = AUDIO_BLOCK * 2 - __HAL_DMA_GET_COUNTER(&hdma_adc2);
-  // leer la mitad que el ADC NO está escribiendo
   const volatile uint16_t *src = (wpos < AUDIO_BLOCK) ? &adc_in[AUDIO_BLOCK] : &adc_in[0];
+
+  float g = flt_g, k = flt_k;                    // copia local: no cambian a mitad del bloque
+
   for (uint32_t i = 0; i < AUDIO_BLOCK; i++) {
     float x = (float)src[i];
-    in_dc += 0.0005f * (x - in_dc);              // promedio lento = nivel DC
-    int16_t s = sat16((x - in_dc) * IN_GAIN);    // quitar DC y amplificar
-    dst[2 * i]     = s;                          // L
-    dst[2 * i + 1] = s;                          // R
+    in_dc += 0.0005f * (x - in_dc);
+    float in = (x - in_dc) * IN_GAIN / 32768.0f; // señal normalizada a ±1
+
+    float u = in - k * y4;                       // realimentación
+    u = u / (1.0f + fabsf(u));                   // soft clip
+    y1 += g * (u  - y1);                         // 4 etapas de un polo en cascada
+    y2 += g * (y1 - y2);
+    y3 += g * (y2 - y3);
+    y4 += g * (y3 - y4);
+
+    float out = y4 * (1.0f + 0.5f * k);          // compensa la pérdida de volumen por la resonancia
+    int16_t s = sat16(out * 32768.0f);
+    dst[2 * i]     = s;
+    dst[2 * i + 1] = s;
   }
 }
 /* USER CODE END 0 */
@@ -812,12 +828,15 @@ void StartDefaultTask(void *argument)
   */
   uint8_t wave_last = 0xFF; // ultima forma de onda enviada; 0xFF fuerza el primer envio
   float filt0 = pots[0];
+  float filt1 = pots[1];
   for(;;)
   {
     // pots[0]: frecuencia, filtrada con EMA + histeresis de 8 cuentas
     filt0 += 0.1f * ((float)pots[0] - filt0);
     v = (uint32_t)filt0;
-
+    filt1 += 0.1f * ((float)pots[1] - filt1);
+    float fc = 30.0f * powf(400.0f, filt1 / 4095.0f);
+    flt_g = 1.0f - expf(-TWO_PI * fc / AUDIO_FS);
     if (v > last + 8 || v + 8 < last) {
       last = v;
       f = 20.0f * powf(100.0f, v / 4095.0f); // 20 Hz a 2 kHz, curva exponencial
