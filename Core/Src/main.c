@@ -33,7 +33,11 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define AUDIO_FS     48000.0f    // frecuencia de muestreo
+#define AUDIO_BLOCK  128         // frames estéreo por cada mitad del buffer
+#define AUDIO_AMP    8000.0f     // amplitud (~25% de la escala de int16) para no saturar
+#define TWO_PI       6.28318530718f
+#define CS43L22_ADDR (0x4A << 1)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -46,6 +50,9 @@ ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 
 I2C_HandleTypeDef hi2c1;
+
+I2S_HandleTypeDef hi2s3;
+DMA_HandleTypeDef hdma_spi3_tx;
 
 SPI_HandleTypeDef hspi2;
 
@@ -63,7 +70,9 @@ const osThreadAttr_t defaultTask_attributes = {
 // global: el DMA escribe aquí continuamente, debe existir siempre (no en el stack)
 // volatile: la modifica el hardware, el compilador no debe asumir que no cambia
 volatile uint16_t pots[4];
-volatile uint32_t n_freq = 0, n_wave = 0;
+int16_t audio_buf[AUDIO_BLOCK * 2 * 2];   // 2 mitades × 128 frames × 2 canales = 512
+volatile float audio_freq = 440.0f;       // frecuencia de la sinusoide generada en el MCU
+float audio_phase = 0.0f;                 // fase acumulada, en radianes
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -74,6 +83,7 @@ static void MX_I2C1_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_SPI2_Init(void);
 static void MX_TIM3_Init(void);
+static void MX_I2S3_Init(void);
 void StartDefaultTask(void *argument);
 
 /* USER CODE BEGIN PFP */
@@ -104,6 +114,42 @@ static void ad9833_init(float f) {
 }
 static void ad9833_set_wave(uint16_t ctrl) {
   ad9833_write(ctrl);
+}
+
+// --- CS43L22 ---
+static void cs43l22_write(uint8_t reg, uint8_t val) {
+  HAL_I2C_Mem_Write(&hi2c1, CS43L22_ADDR, reg, I2C_MEMADD_SIZE_8BIT, &val, 1, 100);
+}
+static uint8_t cs43l22_read(uint8_t reg) {
+  uint8_t val = 0;
+  HAL_I2C_Mem_Read(&hi2c1, CS43L22_ADDR, reg, I2C_MEMADD_SIZE_8BIT, &val, 1, 100);
+  return val;
+}
+// Configura el códec y lo deja apagado; se enciende después de arrancar los relojes I2S
+static void cs43l22_init(void) {
+  cs43l22_write(0x02, 0x01);                          // Power Ctl 1: apagado mientras se configura
+  // "Required Initialization Settings" del datasheet (registros obligatorios)
+  cs43l22_write(0x00, 0x99);
+  cs43l22_write(0x47, 0x80);
+  cs43l22_write(0x32, cs43l22_read(0x32) | 0x80);
+  cs43l22_write(0x32, cs43l22_read(0x32) & ~0x80);
+  cs43l22_write(0x00, 0x00);
+  cs43l22_write(0x04, 0xAF);                          // Power Ctl 2: audífonos ON, parlante interno OFF
+  cs43l22_write(0x05, 0x80);                          // Clocking: auto-detección de MCLK
+  cs43l22_write(0x06, 0x04);                          // Interface Ctl 1: esclavo, formato I2S
+}
+
+//generacion audio
+// Llena n frames estéreo con una sinusoide, la misma muestra en L y R
+static void audio_fill(int16_t *dst, uint32_t n) {
+  float inc = TWO_PI * audio_freq / AUDIO_FS;         // avance de fase por muestra
+  for (uint32_t i = 0; i < n; i++) {
+    int16_t s = (int16_t)(AUDIO_AMP * sinf(audio_phase));
+    dst[2 * i]     = s;                               // L
+    dst[2 * i + 1] = s;                               // R
+    audio_phase += inc;
+    if (audio_phase >= TWO_PI) audio_phase -= TWO_PI;
+  }
 }
 /* USER CODE END 0 */
 
@@ -141,12 +187,21 @@ int main(void)
   MX_ADC1_Init();
   MX_SPI2_Init();
   MX_TIM3_Init();
+  MX_I2S3_Init();
   /* USER CODE BEGIN 2 */
-  //se agrega aca el codigo pq se inicializa recien el dma
+  // ADC1: scan continuo; el DMA copia los 4 canales a pots[] en circulo
   HAL_ADC_Start_DMA(&hadc1, (uint32_t *)pots, 4);
-  //Enables ADC DMA request after last transfer (Single-ADC mode) and enables ADC peripheral
-__HAL_DMA_DISABLE_IT(&hdma_adc1, DMA_IT_TC | DMA_IT_HT);
-HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
+  // apaga las interrupciones de mitad/fin del DMA del ADC (no se usan)
+  __HAL_DMA_DISABLE_IT(&hdma_adc1, DMA_IT_TC | DMA_IT_HT);
+  // encoder: TIM3 cuenta los pasos por hardware
+  HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
+  // CS43L22: sale del reset (PD4 en alto) y espera a que arranque
+  HAL_GPIO_WritePin(Audio_RST_GPIO_Port, Audio_RST_Pin, GPIO_PIN_SET);
+  HAL_Delay(10);
+    cs43l22_init();                                       // configura el códec (apagado)
+  audio_fill(audio_buf, AUDIO_BLOCK * 2);               // llena el buffer completo antes de arrancar
+  HAL_I2S_Transmit_DMA(&hi2s3, (uint16_t *)audio_buf, AUDIO_BLOCK * 2 * 2);  // arranca relojes + DMA
+  cs43l22_write(0x02, 0x9E);                            // Power Ctl 1: encender, ya con MCLK presente
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -355,6 +410,40 @@ static void MX_I2C1_Init(void)
 }
 
 /**
+  * @brief I2S3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2S3_Init(void)
+{
+
+  /* USER CODE BEGIN I2S3_Init 0 */
+
+  /* USER CODE END I2S3_Init 0 */
+
+  /* USER CODE BEGIN I2S3_Init 1 */
+
+  /* USER CODE END I2S3_Init 1 */
+  hi2s3.Instance = SPI3;
+  hi2s3.Init.Mode = I2S_MODE_MASTER_TX;
+  hi2s3.Init.Standard = I2S_STANDARD_PHILIPS;
+  hi2s3.Init.DataFormat = I2S_DATAFORMAT_16B;
+  hi2s3.Init.MCLKOutput = I2S_MCLKOUTPUT_ENABLE;
+  hi2s3.Init.AudioFreq = I2S_AUDIOFREQ_48K;
+  hi2s3.Init.CPOL = I2S_CPOL_LOW;
+  hi2s3.Init.ClockSource = I2S_CLOCK_PLL;
+  hi2s3.Init.FullDuplexMode = I2S_FULLDUPLEXMODE_DISABLE;
+  if (HAL_I2S_Init(&hi2s3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2S3_Init 2 */
+
+  /* USER CODE END I2S3_Init 2 */
+
+}
+
+/**
   * @brief SPI2 Initialization Function
   * @param None
   * @retval None
@@ -449,8 +538,12 @@ static void MX_DMA_Init(void)
 
   /* DMA controller clock enable */
   __HAL_RCC_DMA2_CLK_ENABLE();
+  __HAL_RCC_DMA1_CLK_ENABLE();
 
   /* DMA interrupt init */
+  /* DMA1_Stream5_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream5_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream5_IRQn);
   /* DMA2_Stream0_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
@@ -510,14 +603,6 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : I2S3_WS_Pin */
-  GPIO_InitStruct.Pin = I2S3_WS_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  GPIO_InitStruct.Alternate = GPIO_AF6_SPI3;
-  HAL_GPIO_Init(I2S3_WS_GPIO_Port, &GPIO_InitStruct);
-
   /*Configure GPIO pins : SPI1_SCK_Pin SPI1_MISO_Pin SPI1_MOSI_Pin */
   GPIO_InitStruct.Pin = SPI1_SCK_Pin|SPI1_MISO_Pin|SPI1_MOSI_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
@@ -547,14 +632,6 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : I2S3_MCK_Pin I2S3_SCK_Pin I2S3_SD_Pin */
-  GPIO_InitStruct.Pin = I2S3_MCK_Pin|I2S3_SCK_Pin|I2S3_SD_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  GPIO_InitStruct.Alternate = GPIO_AF6_SPI3;
-  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
   /*Configure GPIO pin : VBUS_FS_Pin */
   GPIO_InitStruct.Pin = VBUS_FS_Pin;
@@ -594,7 +671,14 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-
+// El DMA terminó de enviar la mitad A: rellenarla mientras envía la B
+void HAL_I2S_TxHalfCpltCallback(I2S_HandleTypeDef *hi2s) {
+  audio_fill(&audio_buf[0], AUDIO_BLOCK);
+}
+// El DMA terminó de enviar la mitad B: rellenarla mientras vuelve a enviar la A
+void HAL_I2S_TxCpltCallback(I2S_HandleTypeDef *hi2s) {
+  audio_fill(&audio_buf[AUDIO_BLOCK * 2], AUDIO_BLOCK);
+}
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
@@ -630,6 +714,10 @@ void StartDefaultTask(void *argument)
   // ODR_XL2 ODR_XL1 ODR_XL0 FS1_XL FS0_XL BW_SCAL_ODR BW_XL1 BW_XL0
   // 0 1 1 0 0 0 0 0 
   //ahora separar 4 bytes en 2 cadenas xxxx xxxx y convertirlo en hexadecimal para luego usar HAL_I2C_Mem_Writre
+  volatile uint8_t cs_id = 0;
+  volatile HAL_StatusTypeDef st_cs;
+  //ahora se envia info al chip de audio del mcu
+  st_cs = HAL_I2C_Mem_Read(&hi2c1, 0x4A << 1, 0x01, I2C_MEMADD_SIZE_8BIT, (uint8_t *)&cs_id, 1, 100);
   ad9833_init(440.0f);
   uint32_t last = 0xFFFF;
   volatile uint32_t v = 0;
@@ -656,7 +744,7 @@ void StartDefaultTask(void *argument)
 
     // encoder: cada clic avanza la forma de onda (seno -> triangular -> cuadrada -> seno...)
     volatile uint16_t cnt = __HAL_TIM_GET_COUNTER(&htim3);
-    int16_t pos = (int16_t)cnt / 4;        // 4 cuentas por clic (verificar en Live Watch)
+    int16_t pos = (int16_t)cnt / 4;        // 4 cuentas por cli
     uint8_t wave = ((pos % 3) + 3) % 3;    // siempre 0..2, tambien con pos negativo
     if (wave != wave_last) {
       wave_last = wave;
